@@ -1,0 +1,449 @@
+# vim: ts=2 sw=2 expandtab
+---
+
+- name: test automatic certificate request
+  hosts: demo1,demo2
+  gather_facts: false
+  become: true
+  handlers:
+    - name: test handler 1
+      debug: msg="handler 1"
+    - name: test handler 2
+      debug: msg="handler 2"
+
+  vars:
+    # base settings
+    #cert_token: "{{ inventory_hostname }}"
+    cert_token: demo
+
+    # request specific certificate (tls-server, tls-client, tls-client-server)
+    cert_profile:
+
+    # directory settings
+    cert_certificate_path: /etc/ssl/certs
+    cert_private_path: /etc/ssl/private
+    cert_owner: root
+    cert_group: ssl-cert
+    cert_mode: '0644'
+
+    # key settings
+    cert_key_size: 2048
+    cert_key_type: RSA
+    cert_key_format: auto_ignore
+    cert_key_mode: '0640'
+    cert_key_passphrase:
+
+    # archive old certificates and keys on renew
+    cert_archive: true
+    cert_archive_path: /etc/ssl/archive
+    cert_archive_mkdir: true
+
+    # 360 * 10s = 1h
+    cert_openxpki_endpoint: "https://pki.example.org/rpc/enroll/"
+    cert_retries: 360
+    cert_delay: 1
+
+    # x509 request variables
+    cert_x509_common_name: "{{ inventory_hostname }}.example.org"
+    cert_x509_subject_alt_name:
+      - demo.example.org
+    cert_x509_cn_in_san: true
+
+    # trigger handlers
+    cert_notify:
+      - test handler 1
+      - test handler 2
+
+    # when the certificate is set and valid less then {{ cert_autorenew }}
+    # cert_renew will be set to true. Example: '+28d'
+    cert_autorenew:
+
+    # create fullchain file (cert + chain)
+    cert_fullchain: true
+
+    # create bundle file (key + cert + chain)
+    cert_bundle: true
+
+    # create bundle p12 file
+    cert_p12: true
+
+    # temp for runtime
+    renew: false
+    restart: false
+
+  tasks:
+    - name: prepare - make sure pyOpenSSL is installed
+      apt:
+        name: python3-openssl
+        state: present
+
+    - name: prepare - check for cert_token
+      assert:
+        that: cert_token is string and cert_token | length > 0
+        msg: cert_token must be a non-empty string
+
+    - name: prepare - check for x509 common name
+      assert:
+        that: cert_x509_common_name is string and cert_x509_common_name | length > 0
+        msg: "Required variable cert_req_common_name is not given"
+
+    - name: prepare - cleanup for demo recreation tests
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.csr"
+        - "{{ cert_private_path }}/{{ cert_token }}.key"
+        - "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+        - "{{ cert_private_path }}/{{ cert_token }}.new.key"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.fullchain.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.bundle.pem"
+        - "{{ cert_private_path }}/{{ cert_token }}.p12"
+      when: restart is defined and restart | bool
+
+    - name: prepare - check if certificate already exists
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.key"
+        - "{{ cert_private_path }}/{{ cert_token }}.csr"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.fullchain.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.bundle.pem"
+        - "{{ cert_private_path }}/{{ cert_token }}.p12"
+      register: _check
+
+    - name: prepare - load old certificate info
+      openssl_certificate_info:
+        path: "{{ _check.results[0].item }}"
+        valid_at:
+          autorenew: "{{ cert_autorenew if cert_autorenew != None else '+0' }}"
+      register: _crt
+      when: _check.results[0].stat.exists
+
+    - name: prepare - force renew if expired or cert would expire soon
+      set_fact:
+        renew: true
+      when:
+        - _crt is not skipped
+        - _crt is defined and (_crt.expired is defined and _crt.expired or not _crt.valid_at.autorenew)
+
+    #
+    # create new key and request
+    #
+
+    - name: newkey - block for requesting a new certificate
+      block:
+
+        - name: newkey - create private key
+          openssl_privatekey:
+            path: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            state: present
+            type: "{{ cert_key_type | default('RSA') }}"
+            size: "{{ cert_key_size }}"
+            format: "{{ cert_key_format | default('auto_ignore') }}"
+            owner: "{{ cert_owner }}"
+            group: "{{ cert_group }}"
+            mode: "{{ cert_key_mode }}"
+
+        - name: newkey - create certificate request
+          openssl_csr:
+            path: "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+            state: present
+            privatekey_path: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            owner: "{{ cert_owner }}"
+            group: "{{ cert_group }}"
+            mode: "{{ cert_key_mode }}"
+            common_name: "{{ cert_x509_common_name }}"
+            subject_alt_name: >-
+              {{
+                cert_x509_subject_alt_name
+                if cert_x509_subject_alt_name is string else
+                (
+                []
+                + (['DNS:' + cert_x509_common_name] if cert_x509_cn_in_san else [])
+                + cert_x509_subject_alt_name | map("regex_findall", "^\w+:.+$") | select() | map('first') | list
+                + ['DNS:'] | product(cert_x509_subject_alt_name | map("regex_findall", "^[\w\-\.]+[a-z]$") | select() | map('first')) | map('join') | list
+                + ['IP:'] | product(cert_x509_subject_alt_name | map('ipaddr') | select('string')) | map('join') | list
+                + ['EMAIL:'] | product(cert_x509_subject_alt_name | map("regex_findall", "^[\w\-\._]+@[\w\-\.]+$") | select() | map('first')) | map('join') | list
+                ) | sort | unique
+              }}
+            return_content: true
+          register: _csr
+
+      # end block
+      when: not _check.results[0].stat.exists or renew | bool
+
+    #
+    # request and verify
+    #
+
+    - name: openxpki - request certificate and loop until request has been approved
+      uri:
+        method: POST
+        url: "{{ cert_openxpki_endpoint }}"
+        body_format: form-urlencoded
+        body: >
+          {{
+            {'method': 'RequestCertificate', 'pkcs10': _csr.csr}
+            | combine(
+              {'profile': cert_profile}
+              if cert_profile | default('',true) | length > 0 else
+              {}
+            )
+          }}
+        status_code: [200,202]
+      register: _reqcert
+      until:
+        - _reqcert.status == 200
+        - _reqcert.json.result.proc_state | default('',true) == 'finished'
+      retries: "{{ cert_retries }}"
+      delay: "{{ cert_delay }}"
+      ignore_errors: true
+      become: false
+      delegate_to: localhost
+      when:
+        - _csr is not skipped
+        - _csr.csr | default('',true) | length > 0
+
+    #
+    # error handling block
+    #
+
+    - name: openxpki - error handling block
+      block:
+        - name: openxpki - remove key after finished, non-successful attempts, it might block later requests
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            - "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+          when:
+            - _reqcert.json.result.proc_state | default('',true) == 'finished'
+            - _reqcert.json.result.state | default('',true) != 'SUCCESS'
+
+        - name: openxpki - display request error message
+          pause:
+            seconds: 1
+            prompt: |
+              ===================================
+              Requesting a Certificate has failed
+              ===================================
+
+              Endpoint: {{ cert_openxpki_endpoint }}
+              HTTP Status Code: {{ _reqcert.status }}
+              Attempts: {{ _reqcert.attempts }}
+
+              Subject: CN={{ cert_x509_common_name }}
+              Workflow ID: {{ _reqcert.json.result.id | default('',true) }}
+              TransactionID: {{ _reqcert.json.result.data.transaction_id | default('',true) }}
+              State: {{ _reqcert.json.result.state | default('',true) }}
+              Proc State: {{ _reqcert.json.result.proc_state | default('',true) }}
+              Error Code: {{ _reqcert.json.result.data.error_code | default('',true) }}
+          when: _reqcert.json.result.state | default('',true) != 'SUCCESS'
+
+        - name: openxpki - test and stop or request error
+          assert:
+            that:
+              - _reqcert.json is defined
+              - _reqcert.json.result is defined
+              - _reqcert.json.result.state is defined
+              - _reqcert.json.result.state == 'SUCCESS'
+
+      # end block
+      when: _reqcert is not skipped
+
+    #
+    # backup old certificates
+    #
+
+    - name: archive - check for old certificate files
+      stat:
+        path: "{{ item.src }}"
+      loop:
+        - src: "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+          dest: "{{ cert_archive_path }}/{{ cert_token }}.%STAT_CTIME%.crt"
+        - src: "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+          dest: "{{ cert_archive_path }}/{{ cert_token }}.%STAT_CTIME%.chain.crt"
+        - src: "{{ cert_private_path }}/{{ cert_token }}.key"
+          dest: "{{ cert_archive_path }}/{{ cert_token }}.%STAT_CTIME%.key"
+        - src: "{{ cert_private_path }}/{{ cert_token }}.csr"
+          dest: "{{ cert_archive_path }}/{{ cert_token }}.%STAT_CTIME%.csr"
+      loop_control:
+        label: "{{ item.src }}"
+      register: _stat_backup
+      when:
+        - cert_archive | bool
+        - _reqcert is not skipped
+        - _reqcert.json.result.state == 'SUCCESS'
+        - _reqcert.json.result.data.certificate | default('',true) | length > 0
+
+    - name: archive - make sure archive directory exists
+      file:
+        path: "{{ cert_archive_path }}"
+        state: directory
+        mode: 0700
+        owner: root
+        group: root
+      when:
+        - _stat_backup is not skipped
+        - cert_archive_mkdir | bool
+
+    - name: archive - backup old certificate data
+      copy:
+        src: "{{ item.item.src }}"
+        dest: "{{ item.item.dest | replace('%STAT_CTIME%', '%Y-%m-%d_%H%M%S' | strftime(item.stat.ctime)) }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: 0600
+      loop: "{{ _stat_backup.results }}"
+      loop_control:
+        label: "{{ item.item.src }}"
+      when:
+        - _stat_backup is not skipped
+        - item.stat.exists | bool
+
+    #
+    # make new certificates active
+    #
+
+    - name: activate - remove all old certificates files
+      file:
+        path: "{{ item.item }}"
+        state: absent
+      loop: "{{ _check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - _reqcert is not skipped
+        - _reqcert.json.result.state == 'SUCCESS'
+        - _reqcert.json.result.data.certificate | default('',true) | length > 0
+
+    - name: activate - write new certificates
+      copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_mode }}"
+      loop:
+        - dest: "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+          content: "{{ _reqcert.json.result.data.certificate }}"
+        - dest: "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+          content: "{{ _reqcert.json.result.data.chain | default('',true) }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      register: _reqcert_write
+      notify: "{{ cert_notify }}"
+      when:
+        - _reqcert is not skipped
+        - _reqcert.json.result.state == 'SUCCESS'
+        - item.content | length > 0
+
+    - name: activate - make new key active
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_key_mode }}"
+      loop:
+        - src: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+          dest: "{{ cert_private_path }}/{{ cert_token }}.key"
+        - src: "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+          dest: "{{ cert_private_path }}/{{ cert_token }}.csr"
+      loop_control:
+        label: "{{ item.dest }}"
+      register: _copy_key
+      when: _reqcert_write is changed
+
+    #
+    # special purpose files
+    #
+
+    - name: bundles - read certificates files
+      slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.key"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+      register: _slurp
+      ignore_errors: true
+      failed_when: false
+
+    - name: bundles - create fullchain file
+      copy:
+        dest: "{{ cert_certificate_path }}/{{ cert_token }}.fullchain.crt"
+        content: |
+          {{ _slurp.results[0].content | b64decode }}
+          {{ _slurp.results[2].content | b64decode }}
+        force: false
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_mode }}"
+      register: _fullchain
+      when:
+        - cert_fullchain | bool
+        - _slurp.results[0].content | default('',true) | length > 0
+        - _slurp.results[2].content | default('',true) | length > 0
+
+    - name: bundles - create bundle file
+      copy:
+        dest: "{{ cert_private_path }}/{{ cert_token }}.bundle.pem"
+        content: |
+          {{ _slurp.results[0].content | b64decode }}
+          {{ _slurp.results[1].content | b64decode }}
+          {% if  _slurp.results[2].content | default('',true) | length > 0 %}
+          {{ _slurp.results[2].content | b64decode }}
+          {% endif %}
+        force: false
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_mode }}"
+      register: _bundle
+      when:
+        - cert_bundle | bool
+        - _slurp.results[0].content | default('',true) | length > 0
+        - _slurp.results[1].content | default('',true) | length > 0
+
+    - name: bundles - create p12 file
+      openssl_pkcs12:
+        action: export
+        path: "{{ cert_private_path }}/{{ cert_token }}.p12"
+        friendly_name: "{{ cert_token }}"
+        privatekey_path: "{{ cert_private_path }}/{{ cert_token }}.key"
+        certificate_path: "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        other_certificates_parse_all: true
+        other_certificates: "{{ [ cert_certificate_path + '/' + cert_token + '.chain.crt' ] if _slurp.results[2].content | default('',true) | length > 0 else [] }}"
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_mode }}"
+      register: _p12
+      when:
+        - cert_p12 | bool
+        - _slurp.results[0].content | default('',true) | length > 0
+        - _slurp.results[1].content | default('',true) | length > 0
+
+    #
+    # cleanup
+    #
+
+    - name: cleanup - reset notifiy list
+      set_fact:
+        cert_notify: []
+
+    - name: cleanup - cleanup temp new key
+      file:
+        path: "{{ item.item.src }}"
+        state: absent
+      loop: "{{ _copy_key.results }}"
+      loop_control:
+        label: "{{ item.item.src }}"
+      when: _copy_key is changed

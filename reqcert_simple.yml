@@ -1,0 +1,277 @@
+# vim: ts=2 sw=2 expandtab
+---
+
+- name: test automatic certificate request
+  hosts: demo1,demo2
+  gather_facts: false
+  become: true
+  handlers:
+    - name: test handler 1
+      debug: msg="handler 1"
+    - name: test handler 2
+      debug: msg="handler 2"
+
+  vars:
+    # base settings
+    #cert_token: "{{ inventory_hostname }}"
+    cert_token: demo
+
+    # request specific certificate (tls-server, tls-client, tls-client-server)
+    cert_profile:
+
+    # directory settings
+    cert_certificate_path: /etc/ssl/certs
+    cert_private_path: /etc/ssl/private
+    cert_owner: root
+    cert_group: ssl-cert
+    cert_mode: '0644'
+
+    # key settings
+    cert_key_size: 2048
+    cert_key_type: RSA
+    cert_key_format: auto_ignore
+    cert_key_mode: '0640'
+    cert_key_passphrase:
+
+    # 360 * 10s = 1h
+    cert_openxpki_endpoint: "https://pki.example.org/rpc/enroll/"
+    cert_retries: 360
+    cert_delay: 1
+
+    # x509 request variables
+    cert_x509_common_name: "{{ inventory_hostname }}.example.org"
+    cert_x509_subject_alt_name:
+      - demo.example.org
+    cert_x509_cn_in_san: true
+
+    # trigger handlers
+    cert_notify:
+      - test handler 1
+      - test handler 2
+
+    # temp for runtime
+    renew: false
+    restart: false
+
+  tasks:
+    - name: prepare - make sure pyOpenSSL is installed
+      apt:
+        name: python3-openssl
+        state: present
+
+    - name: prepare - cleanup for demo recreation tests
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.csr"
+        - "{{ cert_private_path }}/{{ cert_token }}.key"
+        - "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+        - "{{ cert_private_path }}/{{ cert_token }}.new.key"
+      when: restart is defined and restart | bool
+
+    - name: prepare - check if certificate already exists
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+        - "{{ cert_private_path }}/{{ cert_token }}.key"
+        - "{{ cert_private_path }}/{{ cert_token }}.csr"
+        - "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+      register: _check
+
+    #
+    # create new key and request
+    #
+
+    - name: newkey - block for requesting a new certificate
+      block:
+
+        - name: newkey - create private key
+          openssl_privatekey:
+            path: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            state: present
+            type: "{{ cert_key_type | default('RSA') }}"
+            size: "{{ cert_key_size }}"
+            format: "{{ cert_key_format | default('auto_ignore') }}"
+            owner: "{{ cert_owner }}"
+            group: "{{ cert_group }}"
+            mode: "{{ cert_key_mode }}"
+
+        - name: newkey - create certificate request
+          openssl_csr:
+            path: "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+            state: present
+            privatekey_path: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            owner: "{{ cert_owner }}"
+            group: "{{ cert_group }}"
+            mode: "{{ cert_key_mode }}"
+            common_name: "{{ cert_x509_common_name }}"
+            subject_alt_name: >-
+              {{
+                cert_x509_subject_alt_name
+                if cert_x509_subject_alt_name is string else
+                (
+                []
+                + (['DNS:' + cert_x509_common_name] if cert_x509_cn_in_san else [])
+                + cert_x509_subject_alt_name | map("regex_findall", "^\w+:.+$") | select() | map('first') | list
+                + ['DNS:'] | product(cert_x509_subject_alt_name | map("regex_findall", "^[\w\-\.]+[a-z]$") | select() | map('first')) | map('join') | list
+                + ['IP:'] | product(cert_x509_subject_alt_name | map('ipaddr') | select('string')) | map('join') | list
+                + ['EMAIL:'] | product(cert_x509_subject_alt_name | map("regex_findall", "^[\w\-\._]+@[\w\-\.]+$") | select() | map('first')) | map('join') | list
+                ) | sort | unique
+              }}
+            return_content: true
+          register: _csr
+
+      # end block
+      when: not _check.results[0].stat.exists or renew | bool
+
+    #
+    # request and verify
+    #
+
+    - name: openxpki - request certificate and loop until request has been approved
+      uri:
+        method: POST
+        url: "{{ cert_openxpki_endpoint }}"
+        body_format: form-urlencoded
+        body: >
+          {{
+            {'method': 'RequestCertificate', 'pkcs10': _csr.csr}
+            | combine(
+              {'profile': cert_profile}
+              if cert_profile | default('',true) | length > 0 else
+              {}
+            )
+          }}
+        status_code: [200,202]
+      register: _reqcert
+      until:
+        - _reqcert.status == 200
+        - _reqcert.json.result.proc_state | default('',true) == 'finished'
+      retries: "{{ cert_retries }}"
+      delay: "{{ cert_delay }}"
+      ignore_errors: true
+      become: false
+      delegate_to: localhost
+      when:
+        - _csr is not skipped
+        - _csr.csr | default('',true) | length > 0
+
+    #
+    # error handling block
+    #
+
+    - name: openxpki - error handling block
+      block:
+        - name: openxpki - remove key after finished, non-successful attempts, it might block later requests
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ cert_private_path }}/{{ cert_token }}.new.key"
+            - "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+          when:
+            - _reqcert.json.result.proc_state | default('',true) == 'finished'
+            - _reqcert.json.result.state | default('',true) != 'SUCCESS'
+
+        - name: openxpki - display request error message
+          pause:
+            seconds: 1
+            prompt: |
+              ===================================
+              Requesting a Certificate has failed
+              ===================================
+
+              Endpoint: {{ cert_openxpki_endpoint }}
+              HTTP Status Code: {{ _reqcert.status }}
+              Attempts: {{ _reqcert.attempts }}
+
+              Subject: CN={{ cert_x509_common_name }}
+              Workflow ID: {{ _reqcert.json.result.id | default('',true) }}
+              TransactionID: {{ _reqcert.json.result.data.transaction_id | default('',true) }}
+              State: {{ _reqcert.json.result.state | default('',true) }}
+              Proc State: {{ _reqcert.json.result.proc_state | default('',true) }}
+              Error Code: {{ _reqcert.json.result.data.error_code | default('',true) }}
+          when: _reqcert.json.result.state | default('',true) != 'SUCCESS'
+
+        - name: openxpki - test and stop or request error
+          assert:
+            that:
+              - _reqcert.json is defined
+              - _reqcert.json.result is defined
+              - _reqcert.json.result.state is defined
+              - _reqcert.json.result.state == 'SUCCESS'
+
+      # end block
+      when: _reqcert is not skipped
+
+    #
+    # make new certificates active
+    #
+
+    - name: activate - remove all old certificates files
+      file:
+        path: "{{ item.item }}"
+        state: absent
+      loop: "{{ _check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - _reqcert is not skipped
+        - _reqcert.json.result.state == 'SUCCESS'
+        - _reqcert.json.result.data.certificate | default('',true) | length > 0
+
+    - name: activate - write new certificates
+      copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_mode }}"
+      loop:
+        - dest: "{{ cert_certificate_path }}/{{ cert_token }}.crt"
+          content: "{{ _reqcert.json.result.data.certificate }}"
+        - dest: "{{ cert_certificate_path }}/{{ cert_token }}.chain.crt"
+          content: "{{ _reqcert.json.result.data.chain | default('',true) }}"
+      loop_control:
+        label: "{{ item.dest }}"
+      register: _reqcert_write
+      notify: "{{ cert_notify }}"
+      when:
+        - _reqcert is not skipped
+        - _reqcert.json.result.state == 'SUCCESS'
+        - item.content | length > 0
+
+    - name: activate - make new key active
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+        owner: "{{ cert_owner }}"
+        group: "{{ cert_group }}"
+        mode: "{{ cert_key_mode }}"
+      loop:
+        - src: "{{ cert_private_path }}/{{ cert_token }}.new.key"
+          dest: "{{ cert_private_path }}/{{ cert_token }}.key"
+        - src: "{{ cert_private_path }}/{{ cert_token }}.new.csr"
+          dest: "{{ cert_private_path }}/{{ cert_token }}.csr"
+      loop_control:
+        label: "{{ item.dest }}"
+      register: _copy_key
+      when: _reqcert_write is changed
+
+    #
+    # cleanup
+    #
+
+    - name: cleanup - cleanup temp new key
+      file:
+        path: "{{ item.item.src }}"
+        state: absent
+      loop: "{{ _copy_key.results }}"
+      loop_control:
+        label: "{{ item.item.src }}"
+      when: _copy_key is changed
